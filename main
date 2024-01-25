@@ -1,0 +1,787 @@
+from flask_restful import Resource, Api
+from flask import Flask, request,redirect
+from main_config import *
+from waitress import serve
+import threading
+import requests
+import logging
+import socket
+
+CUSTOM_LVL = 25
+logging.addLevelName(CUSTOM_LVL,'INFO')
+logging.basicConfig(filename=logs_path, filemode='a',level=CUSTOM_LVL,format='%(asctime)s :%(levelname)s:%(message)s',datefmt='%Y-%m-%d %H:%M:%S')
+
+app = Flask(__name__)
+api = Api(app)
+
+def request_block(data):
+	requests.put(moderation_load_balancer_path,json=data)
+
+def send_block(data):
+	threading.Thread(target=request_block, args=[data]).start()
+
+def send_block_to_conn_service(data):
+	requests.put(connection_service_path + '/ModerationCommit',json=data)
+
+def send_block_to_conn(data):
+	threading.Thread(target=send_block_to_conn_service, args=[data]).start()
+
+class RootHealthCheck(Resource):
+
+	def get(self):
+		return 'OK', 200
+
+class ModerationRoute(Resource):
+
+	def get(self):
+		return 'OK', 200
+
+	def put(self):
+		logging.log(CUSTOM_LVL,f' GateWay: ReRoute block to balancer --> B{str(hash(str(request.json)))[-5:]}_{len(request.json)}')
+
+		send_block(request.json)
+
+		return 'OK', 200
+
+class ModerationReady(Resource):
+
+	def get(self):
+		return 'OK', 200
+
+
+	def put(self):
+		logging.log(CUSTOM_LVL,f' GateWay: Block ready received --> B{str(hash(str(request.json)))[-5:]}_{len(request.json)}')
+		send_block_to_conn(request.json)
+
+		return 'OK', 200
+
+
+class CheckTraffic(Resource):
+
+	def get(self):  
+		return 'OK', 200
+
+	def put(self):	
+		return requests.put(connection_service_path + '/CheckTraffic',json=request.json).json()
+
+class UpdateUserConfigs(Resource):
+
+	def get(self):
+		return requests.get(connection_service_path + '/UpdateUserConfigs').json()
+
+	def put(self):
+		return 'OK', 200
+
+class RegisterTraffic(Resource):
+
+	def get(self):  
+		return 'OK', 200
+
+	def put(self):	
+		return requests.put(connection_service_path + '/RegisterTraffic',json=request.json).json()
+
+
+class OnReqUpdateUserConfigs(Resource):
+
+	def get(self):  
+		return 'OK', 200
+
+	def put(self):	
+		requests.put(connection_service_path + '/OnReqUpdateUserConfigs',json=request.json)
+		return 'OK', 200
+
+class GetMessages(Resource):
+
+	def get(self):  
+		return 'OK', 200
+
+	def put(self):
+		res = requests.put(connection_service_path + '/GetMessages',json=request.json).json()
+		return res
+
+class GetUsers(Resource):
+
+	def get(self):  
+		return 		requests.get(connection_service_path + '/GetUsers',json=request.json)
+
+	def put(self):
+		return 'OK', 200
+
+
+class BlockUser(Resource):
+
+	def get(self):  
+		return 'OK', 200
+
+	def put(self):
+		requests.put(connection_service_path + '/BlockUser',json=request.json)
+		return 'OK', 200
+
+
+api.add_resource(RootHealthCheck,'/')
+api.add_resource(ModerationRoute,'/ModerationRoute')
+api.add_resource(ModerationReady,'/ModerationReady')
+api.add_resource(CheckTraffic,'/CheckTraffic')
+api.add_resource(RegisterTraffic,'/RegisterTraffic')
+api.add_resource(UpdateUserConfigs,'/UpdateUserConfigs')
+api.add_resource(OnReqUpdateUserConfigs,'/OnReqUpdateUserConfigs')
+api.add_resource(GetMessages,'/GetMessages')
+api.add_resource(BlockUser,'/BlockUser')
+api.add_resource(GetUsers,'/GetUsers')
+
+if __name__ == '__main__':
+	logging.log(CUSTOM_LVL,f' GateWay: RUNNING ON {socket.gethostbyname(socket.gethostname())}:{api_gataway_port}')
+	serve(app,host=api_gateway_host,port=api_gataway_port)
+
+
+
+from main_config import *
+from flask_restful import Resource, Api
+from flask import Flask, request
+from waitress import serve
+import threading
+import requests
+import logging
+import socket
+import pprint
+import time
+
+CUSTOM_LVL = 25
+logging.addLevelName(CUSTOM_LVL,'INFO')
+logging.basicConfig(filename=logs_path, filemode='a',level=CUSTOM_LVL,format='%(asctime)s :%(levelname)s:%(message)s',datefmt='%Y-%m-%d %H:%M:%S')
+
+app = Flask(__name__)
+api = Api(app)
+
+blocks = []
+registered_instances = []
+ 
+class Instance:
+	def __init__(self,instance_name,instance_port,instance_processing):
+		self.instance_name = instance_name
+		self.instance_port = instance_port
+		self.instance_processing = instance_processing
+
+def block_operator():
+	while True:
+		operate_with_blocks()
+
+def run_operating_thread():
+	threading.Thread(target=block_operator).start()
+
+def operate_with_blocks():
+	while blocks:
+		for instance_obj in registered_instances:
+			instance_path = 'http://' + instance_obj.instance_name + ':' + instance_obj.instance_port
+			if not instance_obj.instance_processing:
+				if requests.get(instance_path).status_code == 200:
+					last_block = blocks.pop()
+					logging.log(CUSTOM_LVL,f" LoadBalancer: Block B{str(hash(str(last_block)))[-5:]}_{len(last_block)} routing to --> {instance_obj.instance_name}:{instance_obj.instance_port}")
+					requests.put(instance_path,json=last_block)
+					instance_obj.instance_processing = True
+					break
+
+class Block(Resource):
+
+	def get(self):
+		return 'OK', 200
+
+	def put(self):
+		blocks.append(request.json)
+
+		logging.log(CUSTOM_LVL,f" LoadBalancer: Block added to queue --> B{str(hash(str(request.json)))[-5:]}_{len(request.json)}")
+		
+		return 'OK', 200
+
+class UpdateInstanceState(Resource):
+
+	def get(self):
+		return 'OK', 200
+
+	def put(self):
+		if (str(request.remote_addr)+':'+str(request.form['instance_port'])) in [str(l.instance_name)+':'+str(l.instance_port) for l in registered_instances]:
+
+			for instance_obj in registered_instances:
+				if (instance_obj.instance_name == request.remote_addr) and instance_obj.instance_port == request.form['instance_port']:
+					instance_obj.instance_processing = eval(request.form['instance_processing'])
+					break
+		else:
+			
+			new_instance = Instance(request.remote_addr,request.form['instance_port'],eval(request.form['instance_processing']))
+			registered_instances.append(new_instance)
+
+			logging.log(CUSTOM_LVL,f' LoadBalancer: Instance registered! -->\n {pprint.pformat(vars(new_instance))}')
+		
+		return 'OK', 200
+
+
+
+api.add_resource(Block, '/')
+api.add_resource(UpdateInstanceState, '/UpdateInstanceState')
+
+if __name__ == '__main__':
+	logging.log(CUSTOM_LVL,f' LoadBalancer: RUNNING ON {socket.gethostbyname(socket.gethostname())}:{moderation_load_balancer_port}')
+	run_operating_thread()
+	serve(app,host=moderation_load_balancer_host,port=moderation_load_balancer_port)
+
+
+
+from moderation_service_instance_config import *
+
+from flask_restful import Resource, Api
+from flask import Flask, request
+from waitress import serve
+import threading
+import requests
+import logging
+import socket
+import os
+
+from spacytextblob.spacytextblob import SpacyTextBlob
+from spacy.lang.en.stop_words import STOP_WORDS
+from difflib import SequenceMatcher
+import spacy
+import emoji
+import re
+import ktrain
+
+CUSTOM_LVL = 25
+logging.addLevelName(CUSTOM_LVL,'INFO')
+logging.basicConfig(filename=logs_path, filemode='a',level=CUSTOM_LVL,format='%(asctime)s :%(levelname)s:%(message)s',datefmt='%Y-%m-%d %H:%M:%S')
+
+app = Flask(__name__)
+api = Api(app)
+
+nlp = spacy.load('en_core_web_sm')
+nlp.add_pipe('spacytextblob')
+
+reloaded_predictor = ktrain.load_predictor('tf_model.h5')
+
+runtime_settings = {}
+runtime_settings_hashes = {}
+
+additional_stop_words = ['youtube','instagram','.',',','!','?','_','-',' ','"',"'",'&',';','#']
+for sw in additional_stop_words:
+  STOP_WORDS.add(sw)
+
+def text_similarity(str1, str2):
+    matcher = SequenceMatcher(None, str1, str2)
+    similarity_percent = round(matcher.ratio() * 100)
+    return similarity_percent
+
+def update_runtime_settings():
+	global runtime_settings,runtime_settings_hashes
+	runtime_settings_hashes = {}
+	runtime_settings = requests.get(api_gateway_path_c).json()
+	try:
+		runtime_settings = {int(key): value for key, value in runtime_settings.items()}
+		for l in runtime_settings:
+			runtime_settings_hashes[l] = hash(str(runtime_settings[l]))
+	except:
+		pass
+
+class SimpleStateMachine:
+	def __init__(self):
+		self.PROCESSING = False
+		self.update_instance_state()
+
+	def start_processing_state(self):
+		self.PROCESSING = True
+
+	def end_processing_state(self):
+		self.PROCESSING = False
+		self.update_instance_state()
+
+	def update_instance_state(self):
+		instance_info = {
+		'instance_port' : instance_default_port,
+		'instance_processing' : self.PROCESSING}
+		
+		update_instance_state_on_balance_loader_path = f"http://{temp_BalanceLoaderPath}/UpdateInstanceState"
+	
+		requests.put(update_instance_state_on_balance_loader_path,instance_info)
+
+def moderate_message(traffic_id,user_id,created_at,text):
+  if text is None:
+  	
+  	return False, 'Bad message'
+
+  text = text.lower()
+
+  if text == 'xxx':
+  	return False, 'XXX Found', text
+
+  if runtime_settings[traffic_id]['token_limit_filter']:
+    text_len = len(text)
+    if text_len > runtime_settings[traffic_id]['token_limit_count']:
+      return False, 'Token limit exceeded', {'text_len':text_len}
+
+  if runtime_settings[traffic_id]['blocked_users_filter']:
+    user_in_block_list = user_id in runtime_settings[traffic_id]['blocked_users']
+    if user_in_block_list:
+      return False, 'User in blocked list', {'user_id':user_id}
+
+  if runtime_settings[traffic_id]['black_words_filter']:
+    for b_w in runtime_settings[traffic_id]['black_words']:
+      if b_w in text:
+        return False, 'Black word found', {'black_word':b_w}
+
+  if runtime_settings[traffic_id]['dublications_blocker']:
+    time_query_from = created_at - runtime_settings_detailed[traffic_id]['dublications_time_out']
+    last_messages = client.find({'author_id':user_id,'created_at':{'$gte':time_query_from}})
+    for m in last_messages:
+      text_similarity_level = text_similarity(text,m['message'])
+      if text_similarity_level >= runtime_settings_detailed[traffic_id]['dublications_similarity_level']:
+        return False, 'Text duplication', {'message':m['message'],'text_similarity_level':text_similarity_level}
+
+  text = emoji.replace_emoji(text)
+  text = re.sub('(http.?://.* )|(http.?://.*$)|(www[.].* )|(www[.].*$)','',text)
+  text = re.sub('\d','',text)
+
+  doc = nlp(text)
+
+  clear_words = []
+  for word in doc:
+    if (not word.is_stop): clear_words.append(word.lemma_)
+
+  if runtime_settings[traffic_id]['negative_sentiment_filter']:
+  text_sentiment_level = round(doc._.blob.polarity*100)
+  text_sentiment_neg_level = (lambda l:abs(l) if l < 0 else 0)(text_sentiment_level)
+  if text_sentiment_neg_level >=  runtime_settings[traffic_id]['negative_sentiment_level']:
+    return False, 'Negative sentiment', text_sentiment_neg_level
+
+  if runtime_settings[traffic_id]['context_filter']:
+		if reloaded_predictor.predict(clear_words) == runtime_settings[traffic_id]['context_value']:
+			return False, 'Context filter', ''
+	
+  return True, None, None
+
+
+def block_moderator(query):
+	messages = sorted(query, key=lambda l: l['created_at'],reverse=True)
+	b_hash = f'B{str(hash(str(query)))[-5:]}_{len(query)}'
+	for m in messages:
+		moderation_result, moderation_reason, moderation_desc = moderate_message(traffic_id = m['traffic_id'], user_id = m['user_id'], created_at = m['created_at'], text = m['text'])
+		m['moderation_result'] = moderation_result
+		m['moderation_reason'] = moderation_reason
+		m['moderation_desc'] = moderation_desc
+
+	send_ready(messages)
+		
+	SSM.end_processing_state()
+	logging.log(CUSTOM_LVL,f" Instance {instance_name}:{instance_default_port}: Block ready --> {b_hash}")
+
+def sender_ready(message):
+	requests.put(api_gateway_path,json=message)
+
+def send_ready(message):
+	threading.Thread(target=sender_ready, args=[message]).start()
+
+def send_to_moderator(query):
+	threading.Thread(target=block_moderator, args=[query]).start()
+
+class Instance(Resource):
+
+	def get(self):
+		if SSM.PROCESSING:
+			return 'IN PROCESSING', 102
+		else:
+			return 'OK', 200
+
+	def put(self):
+		logging.log(CUSTOM_LVL,f" Instance {instance_name}:{instance_default_port}: Block received --> B{str(hash(str(request.json)))[-5:]}_{len(request.json)}")
+		SSM.start_processing_state()
+		update_runtime_settings()
+		send_to_moderator(request.json)
+		return 'OK', 200
+		 
+api.add_resource(Instance, '/')
+
+if __name__ == '__main__':
+	global instance_name
+	instance_name = socket.gethostbyname(socket.gethostname())
+	SSM = SimpleStateMachine()
+	update_runtime_settings()
+	serve(app,host=instance_default_host,port=instance_default_port)
+
+
+from flask_restful import Resource, Api
+from flask import Flask, request,redirect
+from main_config import *
+from waitress import serve
+import threading
+import requests
+import logging
+import socket
+import google_auth_oauthlib.flow
+import googleapiclient.discovery
+import googleapiclient.errors
+import os
+import re
+import mariadb
+import pandas
+import time
+from flask import jsonify
+
+CUSTOM_LVL =10
+logging.addLevelName(CUSTOM_LVL,'INFO')
+logging.basicConfig(filename=logs_path, filemode='a',level=CUSTOM_LVL,format='%(asctime)s :%(levelname)s:%(message)s',datefmt='%Y-%m-%d %H:%M:%S')
+
+app = Flask(__name__)
+api = Api(app)
+
+connection = mariadb.connect(
+user=db_user,
+password=db_pass,
+host='localhost',
+port=3306,
+database='main')
+
+done = []
+
+scopes = ['https://www.googleapis.com/auth/youtube.force-ssl']
+
+messages_x_limit = 100
+last_x_messages = {}
+traffic_configs_hashes = {}
+
+def get_all_traffic_configs():
+	global settings
+	_settings = pandas.read_sql('SELECT * FROM traffic_configs', connection).to_dict(orient='records')
+	settings = {}
+	for s in _settings:
+		settings[s['traffic_id']] = s
+
+	for l in settings:
+		traffic_configs_hashes[l] = hash(str(settings[l]))
+
+	return settings
+
+
+def block_user(data):
+	print(data)
+	cursor = connection.cursor()
+	cursor.execute(f"SELECT platform_author_id FROM traffic WHERE id = '{data[0]}'")
+	result = cursor.fetchone()
+	print(result)
+
+def update_user_settings_on_request(data):
+
+	def replace_values(data, old_value, new_value):
+	    return {k: new_value if v == old_value else v for k, v in data.items()}
+
+	data = replace_values(data, 'off', '0')
+	data = replace_values(data, 'on', '1')
+
+	mapper = {'filter_1_switch':'negative_sentiment_filter',
+	'filter_1_value':'negative_sentiment_level'}
+	q = f"UPDATE traffic_configs SET {mapper['filter_1_switch']} = {data['filter_1_switch']} WHERE traffic_id = {data['traffic_id']}"
+	cursor = connection.cursor()
+	cursor.execute(q)
+	connection.commit()
+
+def de_linker(url):
+	return re.search('youtube[.]com[/]watch[?]v=(.*)',url).group(1)
+
+def save_comments(VideoID):
+  data = []
+  while True:
+    params = {'videoId':VideoID,'part':'snippet','pageToken':PageToken,'maxResults':1000,'key':API_KEY,'moderationStatus':'heldForReview'}
+    result = requests.get('https://www.googleapis.com/youtube/v3/commentThreads',params=params).json()
+
+    try:
+      result['items']
+    except:
+      break
+    for l in range(len(result['items'])):
+
+      channelId = result['items'][l]['snippet']['channelId']
+      videoId = result['items'][l]['snippet']['videoId']
+      totalReplyCount = result['items'][l]['snippet']['totalReplyCount']
+      commentId = result['items'][l]['snippet']['topLevelComment']['id']
+      textOriginal = result['items'][l]['snippet']['topLevelComment']['snippet']['textOriginal']
+      try:
+        authorChannelId = result['items'][l]['snippet']['topLevelComment']['snippet']['authorChannelId']['value']
+      except KeyError:
+        authorChannelId = None
+      likeCount = result['items'][l]['snippet']['topLevelComment']['snippet']['likeCount']
+      publishedAt = int(datetime.strptime(result['items'][l]['snippet']['topLevelComment']['snippet']['publishedAt'], "%Y-%m-%dT%H:%M:%SZ").timestamp())
+      sub_data = {'channelId':channelId,
+                  'videoId':videoId,
+                  'commentId':commentId,
+                  'textOriginal':textOriginal,
+                  'authorChannelId':authorChannelId,
+                  'publishedAt':publishedAt,
+                  'type':'comments'}
+
+      data.append(sub_data)
+
+    try:
+      PageToken = result['nextPageToken']
+    except KeyError:
+      PagaToken = None
+      break
+
+  cursor = connection.cursor()
+  for l in data:
+    cursor.execute(
+        'INSERT INTO comments (channelId,videoId,commentId,textOriginal,authorChannelId,publishedAt,type) VALUES (?,?,?,?,?,?,?,?,?)', 
+        (l['channelId'],l['videoId'],l['commentId'],l['textOriginal'],l['authorChannelId'],l['totalReplyCount'],l['likeCount'],l['publishedAt'],l['type']))
+  connection.commit()
+
+def update_categories():
+		
+	messages_rates_df = pandas.read_sql(f'''SELECT platform_user_id, SUM(comments_all_count) as messages_all_count, SUM(comments_calc_count) as messages_calc_count, SUM(comments_neg_count) as messages_neg_count,SUM(comments_sim_count) as messages_sim_count FROM rates WHERE platform_type = 'message' group by platform_user_id''',connection).to_dict(orient='records')
+	rates_df = pandas.read_sql(f'''SELECT platform_user_id, SUM(comments_all_count) as comments_all_count, SUM(comments_calc_count) as comments_calc_count, SUM(comments_neg_count) as comments_neg_count,SUM(comments_sim_count) as comments_sim_count FROM rates WHERE platform_type = 'comments' group by platform_user_id''',connection).to_dict(orient='records')
+	users = {}
+	for l in messages_rates_df:
+		platform_user_id = l['platform_user_id']
+		messages_all_count = int(l['messages_all_count'])
+		messages_calc_count = int(l['messages_calc_count'])
+		messages_neg_count = int(l['messages_neg_count'])
+		messages_sim_count = int(l['messages_sim_count'])
+		category = categories[0]
+		if messages_calc_count >= messages_neg_count_param and int((messages_neg_count/messages_calc_count)*100) >= messages_neg_ratio_param:
+			category = categories[1]
+		if messages_calc_count >= messages_sim_count_param and int((messages_sim_count/messages_calc_count)*100) >= messages_sim_ratio_param:
+			category = categories[1]
+
+		users[platform_user_id] = category
+
+	for l in rates_df:
+		platform_user_id = l['platform_user_id']
+		comments_all_count = int(l['comments_all_count'])
+		comments_calc_count = int(l['comments_calc_count'])
+		comments_neg_count = int(l['comments_neg_count'])
+		comments_sim_count = int(l['comments_sim_count'])
+		if platform_user_id not in users:
+			users[platform_user_id] = category
+		category = users[platform_user_id]
+		if comments_calc_count >= comments_neg_count_param and int((comments_neg_count/comments_calc_count)*100) >= comments_neg_ratio_param:
+			category = categories[2]
+		if comments_calc_count >= comments_sim_count_param and int((comments_sim_count/comments_calc_count)*100) >= comments_sim_ratio_param:
+			category = categories[2]
+			cursor.execute('INSERT INTO user_groups (platform, platform_author_id, platform_user_id, category) VALUES (?, ?, ?, ?);', ('','',platform_user_id,category
+		))
+
+		connection.commit()
+def check_traffic_availability(platform_stream_id):
+	cursor = connection.cursor()
+	cursor.execute(f"SELECT id FROM traffic WHERE platform_stream_id = '{platform_stream_id}'")
+	result = cursor.fetchone()
+	if result is None: 
+		return False
+	else:
+		return result[0]
+
+def get_traffic_configs(traffic_id):
+	cursor = connection.cursor()
+	cursor.execute(f"SELECT * FROM traffic_configs WHERE traffic_id = '{traffic_id}'")
+	result = cursor.fetchone()
+	field_names = [i[0] for i in cursor.description]
+	result_dict = {key: value for key, value in zip(field_names, result)}
+	return result_dict
+
+def check_traffic(url):
+	platform_stream_id = de_linker(url)
+	check_traffic = check_traffic_availability(platform_stream_id)
+	check_traffic_configs = None
+	if check_traffic:
+		check_traffic_configs = get_traffic_configs(check_traffic)
+
+	return check_traffic,check_traffic_configs
+
+def get_users():
+	return pandas.read_sql('SELECT * FROM user_groups', connection).to_dict(orient='records')
+
+def register_traffic(url):
+	stream_id = de_linker(url)
+
+	params = {'id':stream_id,'part':'snippet','key': yt_api_key}
+	
+	platform_author_id = requests.get('https://www.googleapis.com/youtube/v3/videos',params=params).json()['items'][0]['snippet']['channelId']
+
+	params = {'id':stream_id,'part':'liveStreamingDetails','key': yt_api_key}
+	try:
+		chat_id = requests.get('https://www.googleapis.com/youtube/v3/videos',params=params).json()['items'][0]['liveStreamingDetails']['activeLiveChatId']
+	except:
+		chat_id = 'None'
+	cursor = connection.cursor()
+
+	cursor.execute(
+    "INSERT INTO traffic (platform, platform_author_id, platform_stream_id, platform_chat_id, last_page_token, is_active) VALUES (?,?,?,?,?,?)", 
+    ('youtube', platform_author_id, stream_id,chat_id,'',False))
+	connection.commit()
+	cursor.execute(f'SELECT id FROM traffic WHERE platform_stream_id = %s', (stream_id,))
+	traffic_id = cursor.fetchall()[0][0]
+
+	cursor.execute(
+    "INSERT INTO traffic_configs (traffic_id, token_limit_filter, blocked_users_filter, black_words_filter, dublications_filter, negative_sentiment_filter, token_limit_count, dublications_time_out, dublications_similarity_level, negative_sentiment_level) VALUES (?,?,?,?,?,?,?,?,?,?)", 
+    (traffic_id, False, False, False, False, False, 1000, 60, 80, 50))
+	connection.commit()
+	run_parser(traffic_id,chat_id)
+
+def run_yt_parser(traffic_id,chat_id):
+	while True:
+		time.sleep(5)
+		params = {'key': yt_api_key,'part':'snippet','liveChatId':chat_id,'maxResults':2000,'nextPageToken':''}
+		messages = requests.get('https://www.googleapis.com/youtube/v3/liveChat/messages',params=params).json()
+		data = []
+
+		get_all_traffic_configs()
+
+		for item in messages.get('items', []):
+		    snippet = item.get('snippet', {})
+		    message_id = item.get('id')
+		    user_id = snippet.get('authorChannelId')
+		    created_at = snippet.get('publishedAt')
+		    text = snippet.get('textMessageDetails', {}).get('messageText')
+
+		    message_data = {
+		        'traffic_id': traffic_id, 
+		        'message_id': message_id,
+		        'user_id': user_id,
+		        'created_at': created_at,
+		        'text': text,
+		        'traffic_conf_hash':traffic_configs_hashes[traffic_id]
+		    }
+		    if message_id not in done:
+		    	data.append(message_data)
+		    	done.append(message_id)
+
+		url = 'http://10.3.0.1:5000/ModerationRoute'
+		if len(data) > 0: 
+			response = requests.put(url,json=data)
+
+def run_parser(traffic_id,chat_id):
+	threading.Thread(target=run_yt_parser, args=[traffic_id,chat_id]).start()
+
+def auth():
+    os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
+
+    api_service_name = 'youtube'
+    api_version = 'v3'
+
+    flow = google_auth_oauthlib.flow.InstalledAppFlow.from_client_secrets_file(
+        yt_credentials_path, scopes)
+
+    credentials = flow.run_console()
+    youtube = googleapiclient.discovery.build(
+        api_service_name, api_version, credentials=credentials)
+
+    return youtube
+
+def send_data_to_maria_db(data):
+	
+	sql = "INSERT INTO comments_live (traffic_id, platform_user_id, comment_id, comment, created_at, moderation_result, moderation_reason, moderation_desc) VALUES (?,?,?,?,?,?,?,?);"
+	cursor = connection.cursor()
+	for l in data:
+		cursor.execute(
+	    sql,(l['traffic_id'], l['platform_user_id'], l['comment_id'], l['comment'], l['created_at'], l['moderation_result'],l['moderation_reason'],l['moderation_desc']))
+	connection.commit()
+
+	logging.log(CUSTOM_LVL,f' ConnectionS: Data saved --> B{str(hash(str(data)))[-5:]}_{len(data)}')
+
+def send_data_to_db(data):
+	threading.Thread(target=send_data_to_maria_db, args=[data]).start()
+
+def delete_youtube_messages(messages):
+	c = 0
+	for m in messages:
+		c+=1
+		youtube.liveChatMessages().delete(id=m['message_id']).execute()
+	logging.log(CUSTOM_LVL,f' ConnectionS: Comments deleted --> {c}')
+
+def delete_messages(messages):
+	threading.Thread(target=delete_youtube_messages, args=[messages]).start()
+
+class CheckTraffic(Resource):
+
+	def get(self):  
+		return 'OK', 200
+
+	def put(self):
+		return jsonify(check_traffic(request.json))
+
+class ModerationCommit(Resource):
+
+	def get(self):
+		return 'OK', 200
+
+	def put(self):
+
+		logging.log(CUSTOM_LVL,f' ConnectionS: Block ready received --> B{str(hash(str(request.json)))[-5:]}_{len(request.json)}')
+		traffic_id = request.json[0]['traffic_id']
+		if traffic_id not in last_x_messages:
+			last_x_messages[traffic_id] = []
+		for m in request.json:
+			last_x_messages[traffic_id].append(m)
+
+		messages_to_delete = [m for m in request.json if not m.get('moderation_result')]
+		if len(messages_to_delete) != 0: delete_messages(messages_to_delete)
+		send_data_to_db(request.json)
+		return 'OK', 200
+
+class UpdateUserConfigs(Resource):
+
+	def get(self):
+		return jsonify(get_all_traffic_configs())
+
+	def put(self):
+		return 'OK', 200
+
+
+class OnReqUpdateUserConfigs(Resource):
+
+	def get(self):
+		return 'OK', 200
+
+	def put(self):
+		update_user_settings_on_request(request.json)
+		return 'OK', 200
+
+class RegisterTraffic(Resource):
+	def get(self):
+		return 'OK', 200
+
+	def put(self):
+		register_traffic(request.json)
+		return 'OK', 200
+
+class GetUsers(Resource):
+	def get(self):
+		return jsonify(get_users())
+
+	def put(self):
+		return 'OK', 200
+
+class BlockUser(Resource):
+	def get(self):
+		return 'OK', 200
+
+	def put(self):
+		block_user(request.form)
+		return 'OK', 200
+
+class GetMessages(Resource):
+
+	def get(self):
+		return 'OK', 200
+
+	def put(self):
+		res = [{k: v for k, v in item.items() if k != '_id'} for item in last_x_messages[int(request.json)] ]
+		return jsonify(res)
+
+api.add_resource(ModerationCommit,'/ModerationCommit')
+api.add_resource(RegisterTraffic,'/RegisterTraffic')
+api.add_resource(CheckTraffic,'/CheckTraffic')
+api.add_resource(UpdateUserConfigs,'/UpdateUserConfigs')
+api.add_resource(OnReqUpdateUserConfigs,'/OnReqUpdateUserConfigs')
+api.add_resource(GetMessages,'/GetMessages')
+api.add_resource(BlockUser,'/BlockUser')
+api.add_resource(GetUsers,'/GetUsers')
+
+if __name__ == '__main__':
+	youtube = auth()
+	logging.log(CUSTOM_LVL,f' ConnectionS: RUNNING ON {socket.gethostbyname(socket.gethostname())}:{connection_service_port}')
+	serve(app,host=connection_service_host,port=connection_service_port)
